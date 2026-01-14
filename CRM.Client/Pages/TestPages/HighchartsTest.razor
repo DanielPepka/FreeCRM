@@ -1,0 +1,750 @@
+﻿@* 
+================================================================================
+HighchartsTest.razor
+
+PURPOSE
+    Demonstrates Highcharts component capabilities with live, timer-driven
+    data updates. Use this page to understand how each chart type works and
+    as a reference when implementing charts in your own pages.
+
+CHART TYPES DEMONSTRATED
+    1. Column (Categorical)    - Grouped bar chart with string x-axis categories
+    2. Pie                     - Simple pie chart showing category distribution
+    3. LineTimeSeries          - Zoomable line chart with datetime x-axis
+    4. ColumnTimeSeries        - Zoomable bar chart with datetime x-axis
+    5. AreaTotals              - Gradient-filled area chart for cumulative data
+    6. PieWithDrilldown        - Pie chart with click-through detail breakdown
+
+DATA PATTERNS
+    - Rolling Window: Most charts trim to last N points (configurable via MaxPoints)
+    - Full History: One chart retains all data since page load (no trimming)
+    - Real-time Updates: Timer adds new random data points at configurable intervals
+
+USER CONTROLS
+    - Interval Slider: Adjust update frequency from 1-15 seconds
+    - Pause/Resume: Stop and restart the timer without losing data
+
+THREAD SAFETY
+    All data mutations occur inside a lock (_sync) to prevent race conditions
+    between the timer thread and Blazor's render thread.
+
+USAGE
+    Navigate to /HighchartsTest or /{TenantCode}/HighchartsTest to view.
+    Copy chart configurations from this page as starting points for your own.
+
+SEE ALSO
+    - Highcharts.razor      : The chart wrapper component
+    - Highcharts.razor.js   : JavaScript interop for Highcharts library
+    - Highcharts.razor.css  : Chart styling
+================================================================================
+*@
+
+@page "/HighchartsTest"
+@page "/{TenantCode}/HighchartsTest"
+@implements IDisposable
+@inject BlazorDataModel Model
+@using BlazorSortableList
+
+@if(Model.Loaded && Model.LoggedIn && Model.View == _pageName) {
+    <h1>Highcharts Test Page</h1>
+
+    @* ========================================================================
+       TIMER CONTROLS
+       Allow users to adjust update frequency and pause/resume data generation.
+       ======================================================================== *@
+    <div class="card shadow-sm mb-3">
+        <div class="card-header"><strong>Timer Controls</strong></div>
+        <div class="card-body">
+            <div class="row align-items-center g-3">
+                @* Interval Slider *@
+                <div class="col-md-6">
+                    <label class="form-label fw-semibold">
+                        Interval: @_timerIntervalSeconds s (range 1–15)
+                    </label>
+                    <input type="range"
+                           class="form-range"
+                           min="1"
+                           max="15"
+                           step="1"
+                           @bind="_timerIntervalSeconds"
+                           @bind:event="oninput"
+                           @bind:after="ApplyIntervalFromSlider" />
+                </div>
+                
+                @* Pause/Resume Button *@
+                <div class="col-md-3">
+                    <button class="btn btn-sm @(_isPaused ? "btn-success" : "btn-warning")"
+                            @onclick="TogglePause">
+                        @(_isPaused ? "Resume" : "Pause")
+                    </button>
+                </div>
+                
+                @* Status Display *@
+                <div class="col-md-3">
+                    <div class="text-muted small">
+                        Status: <span class="fw-semibold">@(_isPaused ? "Paused" : "Running")</span><br />
+                        Effective Interval: <span class="fw-semibold">@(_timer.Interval / 1000d) s</span>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div class="mb-2">
+        This page demonstrates all available chart types with live data updates.
+    </div>
+
+    @* Last timer tick output for debugging *@
+    <div class="mb-2">@_timerOutput</div>
+
+    @* ========================================================================
+       PRELOAD HIGHCHARTS
+       This component with PreloadResources="true" loads the Highcharts library.
+       Only one preload component is needed per page. Subsequent chart components
+       will use the already-loaded library.
+       ======================================================================== *@
+    <Highcharts PreloadResources="true" @ref="_highcharts" />
+
+    @* ========================================================================
+       ROW 1: CATEGORICAL CHARTS
+       These charts use string categories on the x-axis rather than datetime.
+       ======================================================================== *@
+    <div class="row">
+        @* Column Chart (Categorical) - Grouped bars with string x-axis *@
+        <div class="col-sm-6 mb-3">
+            <div class="card shadow-sm">
+                <div class="card-header">
+                    <strong>Column (Categorical) — Last @MaxPoints Points</strong>
+                </div>
+                <div class="card-body">
+                    <div id="timer-chart"></div>
+                    <Highcharts ChartType="Highcharts.ChartTypes.Column"
+                                ElementId="timer-chart"
+                                ChartTitle="@($"Per-Category Values (last {MaxPoints})")"
+                                ChartSubtitle="Timestamp vs per-category value 1–20"
+                                yAxisText="Value"
+                                SeriesCategories="_seriesCategories"
+                                SeriesDataArrayItems="_seriesDataPerCategory" />
+                </div>
+            </div>
+        </div>
+
+        @* Pie Chart - Category share distribution *@
+        <div class="col-sm-6 mb-3">
+            <div class="card shadow-sm">
+                <div class="card-header">
+                    <strong>Pie — Category Share</strong>
+                </div>
+                <div class="card-body">
+                    <div id="timer-pie"></div>
+                    <Highcharts ChartType="Highcharts.ChartTypes.Pie"
+                                ElementId="timer-pie"
+                                ChartTitle="Category Contribution"
+                                ChartSubtitle="@($"Window: last {MaxPoints} ticks")"
+                                SeriesDataItems="_pieItems" />
+                </div>
+            </div>
+        </div>
+    </div>
+
+    @* ========================================================================
+       ROW 2: TIME-SERIES CHARTS (WINDOWED)
+       These charts use datetime on the x-axis and support zoom interactions.
+       Data is trimmed to the last MaxPoints entries.
+       ======================================================================== *@
+    <div class="row">
+        @* Line Chart (DateTime) - Zoomable with multi-series legend *@
+        <div class="col-sm-6 mb-3">
+            <div class="card shadow-sm">
+                <div class="card-header">
+                    <strong>Zoomable Line (DateTime) — Last @MaxPoints Points</strong>
+                </div>
+                <div class="card-body">
+                    <div id="timer-line"></div>
+                    <Highcharts ChartType="Highcharts.ChartTypes.LineTimeSeries"
+                                ElementId="timer-line"
+                                ChartTitle="Random Value Over Time"
+                                ChartSubtitle="Drag to zoom, click legend to toggle"
+                                yAxisText="Value"
+                                ShowZoomHint="true"
+                                SeriesDataXYArrayItems="_seriesLineXYPerCategory" />
+                </div>
+            </div>
+        </div>
+
+        @* Column Chart (DateTime) - Zoomable bar chart with datetime x-axis *@
+        <div class="col-sm-6 mb-3">
+            <div class="card shadow-sm">
+                <div class="card-header">
+                    <strong>Zoomable Column (DateTime) — Last @MaxPoints Points</strong>
+                </div>
+                <div class="card-body">
+                    <div id="timer-col-timeseries"></div>
+                    <Highcharts ChartType="Highcharts.ChartTypes.ColumnTimeSeries"
+                                ElementId="timer-col-timeseries"
+                                ChartTitle="Random Value Over Time"
+                                ChartSubtitle="Drag to zoom"
+                                yAxisText="Value"
+                                ShowZoomHint="true"
+                                SeriesDataXYArrayItems="_seriesColumnTsXYPerCategory" />
+                </div>
+            </div>
+        </div>
+    </div>
+
+    @* ========================================================================
+       ROW 3: SPECIALIZED CHARTS (WINDOWED)
+       Area chart for cumulative totals and pie chart with drilldown capability.
+       ======================================================================== *@
+    <div class="row">
+        @* Area Totals - Gradient-filled area chart for cumulative data *@
+        <div class="col-sm-6 mb-3">
+            <div class="card shadow-sm">
+                <div class="card-header">
+                    <strong>Zoomable Area Totals (Gradient) — Last @MaxPoints Points</strong>
+                </div>
+                <div class="card-body">
+                    <div id="timer-area-totals"></div>
+                    <Highcharts ChartType="Highcharts.ChartTypes.AreaTotals"
+                                ElementId="timer-area-totals"
+                                ChartTitle="@($"Cumulative Total (last {MaxPoints})")"
+                                ChartSubtitle="Drag to zoom"
+                                yAxisText="Total"
+                                ShowZoomHint="true"
+                                SeriesDataXYArrayItems="_seriesAreaTotalsXY" />
+                </div>
+            </div>
+        </div>
+
+        @* Pie with Drilldown - Click a slice to see detailed breakdown *@
+        <div class="col-sm-6 mb-3">
+            <div class="card shadow-sm">
+                <div class="card-header">
+                    <strong>Pie with Drilldown — Category → Value Frequency</strong>
+                </div>
+                <div class="card-body">
+                    <div id="timer-pie-drilldown"></div>
+                    <Highcharts ChartType="Highcharts.ChartTypes.PieWithDrilldown"
+                                ElementId="timer-pie-drilldown"
+                                ChartTitle="Breakdown by Category"
+                                ChartSubtitle="Click a category slice to see value frequencies (1–20)"
+                                PieRootItems="_pieRoot"
+                                PieDrilldownItems="_pieDrilldown" />
+                </div>
+            </div>
+        </div>
+    </div>
+
+    @* ========================================================================
+       ROW 4: FULL HISTORY CHART (NO TRIMMING)
+       Demonstrates unbounded data collection. Retains all points since page load.
+       Use this pattern when you need complete historical data.
+       ======================================================================== *@
+    <div class="row">
+        <div class="col-sm-12 mb-3">
+            <div class="card shadow-sm">
+                <div class="card-header">
+                    <strong>Zoomable Line (DateTime) — Full History (No Trim)</strong>
+                </div>
+                <div class="card-body">
+                    <div id="timer-line-full"></div>
+                    <Highcharts ChartType="Highcharts.ChartTypes.LineTimeSeries"
+                                ElementId="timer-line-full"
+                                ChartTitle="Full Timeline — Random Value Over Time"
+                                ChartSubtitle="All points since page load (drag to zoom)"
+                                yAxisText="Value"
+                                ShowZoomHint="true"
+                                SeriesDataXYArrayItems="_seriesLineXYPerCategory_All" />
+                </div>
+            </div>
+        </div>
+    </div>
+}
+
+@code {
+    // ============================================================================
+    // ROUTE PARAMETERS
+    // ============================================================================
+    
+    /// <summary>Optional tenant code from URL. Used for multi-tenant routing.</summary>
+    [Parameter] public string? TenantCode { get; set; }
+
+    // ============================================================================
+    // PAGE STATE
+    // ============================================================================
+    
+    /// <summary>Page identifier for Model.View comparison.</summary>
+    protected string _pageName = "highchartstest";
+    
+    /// <summary>Tracks whether initial data load has completed.</summary>
+    protected bool _loadedData = false;
+
+    // ============================================================================
+    // TIMER CONFIGURATION
+    // ============================================================================
+    
+    /// <summary>Timer that generates new data points at regular intervals.</summary>
+    protected System.Timers.Timer _timer = new(5000);
+    
+    /// <summary>Lock object for thread-safe access to shared data collections.</summary>
+    private readonly object _sync = new();
+    
+    /// <summary>Random number generator for demo data.</summary>
+    private Random _rng = new();
+
+    /// <summary>Current timer interval in seconds (bound to slider, range 1-15).</summary>
+    private int _timerIntervalSeconds = 5;
+    
+    /// <summary>Whether the timer is currently paused.</summary>
+    private bool _isPaused = false;
+    
+    /// <summary>Display string showing last timer tick details.</summary>
+    protected string _timerOutput = "";
+
+    // ============================================================================
+    // DEMO DATA CONFIGURATION
+    // ============================================================================
+    
+    /// <summary>Category names used in demo data generation.</summary>
+    private readonly string[] _catNames = new[] { "Alpha", "Beta", "Gamma" };
+
+    // ============================================================================
+    // CHART CONFIGURATION
+    // ============================================================================
+    
+    /// <summary>Reference to the preload Highcharts component.</summary>
+    protected Highcharts _highcharts = null!;
+    
+    /// <summary>Maximum points to retain in windowed (trimmed) charts.</summary>
+    private const int MaxPoints = 30;
+    
+    /// <summary>Maximum points for XY time-series data (same as MaxPoints).</summary>
+    private const int MaxPointsXY = MaxPoints;
+
+    // ============================================================================
+    // DATA STORES: ROLLING WINDOW (TRIMMED TO MaxPoints)
+    // These collections are trimmed to show only the most recent data.
+    // ============================================================================
+    
+    /// <summary>X-axis labels for categorical charts (HH:MM:SS format).</summary>
+    private readonly List<string> _categories = new();
+    
+    /// <summary>Per-category values for categorical column chart.</summary>
+    private readonly Dictionary<string, List<decimal>> _perCatValues = new();
+    
+    /// <summary>Per-category [timestamp, value] arrays for time-series charts.</summary>
+    private readonly Dictionary<string, List<long[]>> _perCatXY = new();
+    
+    /// <summary>Cumulative total [timestamp, total] arrays for area chart.</summary>
+    private readonly List<long[]> _xyTotals = new();
+    
+    /// <summary>Running sum for cumulative totals.</summary>
+    private int _runningTotal = 0;
+
+    // ============================================================================
+    // DATA STORES: FULL HISTORY (NO TRIMMING)
+    // These collections retain all data since page load.
+    // ============================================================================
+    
+    /// <summary>Per-category [timestamp, value] arrays - unbounded.</summary>
+    private readonly Dictionary<string, List<long[]>> _perCatXYAll = new();
+    
+    /// <summary>Cumulative total [timestamp, total] arrays - unbounded.</summary>
+    private readonly List<long[]> _xyTotalsAll = new();
+
+    // ============================================================================
+    // CHART BINDINGS: CATEGORICAL COLUMN
+    // ============================================================================
+    
+    /// <summary>X-axis category labels for column chart.</summary>
+    protected string[] _seriesCategories = Array.Empty<string>();
+    
+    /// <summary>Series data arrays for grouped column chart.</summary>
+    protected Highcharts.SeriesDataArray[] _seriesDataPerCategory = Array.Empty<Highcharts.SeriesDataArray>();
+
+    // ============================================================================
+    // CHART BINDINGS: TIME-SERIES (LINE/COLUMN)
+    // ============================================================================
+    
+    /// <summary>XY data for line time-series chart (trimmed).</summary>
+    protected Highcharts.SeriesDataXYArray[] _seriesLineXYPerCategory = Array.Empty<Highcharts.SeriesDataXYArray>();
+    
+    /// <summary>XY data for column time-series chart (trimmed).</summary>
+    protected Highcharts.SeriesDataXYArray[] _seriesColumnTsXYPerCategory = Array.Empty<Highcharts.SeriesDataXYArray>();
+
+    // ============================================================================
+    // CHART BINDINGS: AREA TOTALS
+    // ============================================================================
+    
+    /// <summary>XY data for area totals chart (trimmed).</summary>
+    protected Highcharts.SeriesDataXYArray[] _seriesAreaTotalsXY = Array.Empty<Highcharts.SeriesDataXYArray>();
+
+    // ============================================================================
+    // CHART BINDINGS: PIE CHARTS
+    // ============================================================================
+    
+    /// <summary>Data items for simple pie chart.</summary>
+    protected Highcharts.SeriesData[] _pieItems = Array.Empty<Highcharts.SeriesData>();
+    
+    /// <summary>Root-level data for pie with drilldown.</summary>
+    protected Highcharts.SeriesData[] _pieRoot = Array.Empty<Highcharts.SeriesData>();
+    
+    /// <summary>Drilldown series for pie with drilldown.</summary>
+    protected Highcharts.DrilldownSeries[] _pieDrilldown = Array.Empty<Highcharts.DrilldownSeries>();
+
+    // ============================================================================
+    // CHART BINDINGS: FULL HISTORY
+    // ============================================================================
+    
+    /// <summary>XY data for full-history line chart (no trimming).</summary>
+    protected Highcharts.SeriesDataXYArray[] _seriesLineXYPerCategory_All = Array.Empty<Highcharts.SeriesDataXYArray>();
+
+    // ============================================================================
+    // LIFECYCLE: DISPOSE
+    // Clean up event handlers and timer resources.
+    // ============================================================================
+    
+    public void Dispose()
+    {
+        Model.OnChange -= OnDataModelUpdated;
+        _timer.Elapsed -= TimerExecuted;
+        _timer.Dispose();
+        
+        if(Model.Subscribers_OnChange.Contains(_pageName))
+            Model.Subscribers_OnChange.Remove(_pageName);
+    }
+
+    // ============================================================================
+    // LIFECYCLE: AFTER RENDER
+    // Handle first-render setup and authentication checks.
+    // ============================================================================
+    
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if(firstRender) {
+            Model.TenantCodeFromUrl = TenantCode;
+            Model.OnChange += OnDataModelUpdated;
+        }
+
+        if(Model.Loaded) {
+            if(Model.LoggedIn) {
+                if(!_loadedData) {
+                    _loadedData = true;
+                    await Helpers.ValidateUrl(TenantCode, true);
+                }
+            } else {
+                Helpers.NavigateToLogin();
+            }
+        }
+    }
+
+    // ============================================================================
+    // LIFECYCLE: INITIALIZATION
+    // Set up data structures, seed initial data, and start the timer.
+    // ============================================================================
+    
+    protected override void OnInitialized()
+    {
+        // Register for model change notifications
+        if(!Model.Subscribers_OnChange.Contains(_pageName)) {
+            Model.Subscribers_OnChange.Add(_pageName);
+            Model.OnChange += OnDataModelUpdated;
+        }
+
+        // Initialize per-category data stores
+        foreach(var c in _catNames) {
+            _perCatValues[c] = new List<decimal>();
+            _perCatXY[c] = new List<long[]>();
+            _perCatXYAll[c] = new List<long[]>();
+        }
+
+        // Seed with one initial point so charts don't render empty
+        AddPoint(DateTime.Now, GenerateCategoryValues());
+
+        // Configure and start the timer
+        _timer.AutoReset = true;
+        _timer.Elapsed += TimerExecuted;
+        _timer.Interval = _timerIntervalSeconds * 1000;
+        _timer.Start();
+
+        Model.View = _pageName;
+    }
+
+    // ============================================================================
+    // EVENT HANDLERS
+    // ============================================================================
+    
+    /// <summary>
+    /// Handles data model change notifications. Refreshes UI when this page is active.
+    /// </summary>
+    protected void OnDataModelUpdated()
+    {
+        if(Model.View == _pageName) {
+            StateHasChanged();
+        }
+    }
+
+    /// <summary>
+    /// Timer elapsed handler. Generates new data point and triggers UI refresh.
+    /// Called on timer thread - keep work minimal and marshal UI updates via InvokeAsync.
+    /// </summary>
+    private void TimerExecuted(object? sender, System.Timers.ElapsedEventArgs e)
+    {
+        // Skip if paused (timer may still be running)
+        if(_isPaused)
+            return;
+
+        var now = DateTime.Now;
+        var catVals = GenerateCategoryValues();
+
+        // Add new data point to all charts
+        AddPoint(now, catVals);
+
+        // Update debug output
+        var total = catVals.Values.Sum();
+        _timerOutput = $"{now.ToLongTimeString()}  ->  {total}  ( " + 
+                       string.Join(", ", catVals.Select(kv => $"{kv.Key}:{kv.Value}")) + " )";
+
+        // Marshal UI update to Blazor's render thread
+        _ = InvokeAsync(StateHasChanged);
+    }
+
+    // ============================================================================
+    // TIMER CONTROLS
+    // ============================================================================
+    
+    /// <summary>
+    /// Applies the slider value to the timer interval. Called after slider changes.
+    /// </summary>
+    private void ApplyIntervalFromSlider()
+    {
+        var clamped = Math.Clamp(_timerIntervalSeconds, 1, 15);
+        _timerIntervalSeconds = clamped;
+        _timer.Interval = clamped * 1000;
+        
+        // Keep timer stopped if paused
+        if(_isPaused) {
+            _timer.Stop();
+        }
+    }
+
+    /// <summary>
+    /// Toggles between paused and running states.
+    /// </summary>
+    private void TogglePause()
+    {
+        _isPaused = !_isPaused;
+        
+        if(_isPaused) {
+            _timer.Stop();
+        } else {
+            _timer.Interval = Math.Clamp(_timerIntervalSeconds, 1, 15) * 1000;
+            _timer.Start();
+        }
+    }
+
+    // ============================================================================
+    // DATA GENERATION
+    // ============================================================================
+    
+    /// <summary>
+    /// Generates random values (1-20) for each category.
+    /// </summary>
+    private Dictionary<string, int> GenerateCategoryValues()
+    {
+        var dict = new Dictionary<string, int>(_catNames.Length);
+        foreach(var c in _catNames) {
+            dict[c] = _rng.Next(1, 21);
+        }
+        return dict;
+    }
+
+    /// <summary>
+    /// Converts DateTime to Unix epoch milliseconds for Highcharts datetime x-axis.
+    /// </summary>
+    private static long ToEpochMs(DateTime dt) 
+        => new DateTimeOffset(dt).ToUnixTimeMilliseconds();
+
+    // ============================================================================
+    // DATA MANAGEMENT
+    // ============================================================================
+    
+    /// <summary>
+    /// Adds a new data point to all chart data stores and updates bindings.
+    /// Thread-safe via lock on _sync.
+    /// </summary>
+    private void AddPoint(DateTime timestamp, Dictionary<string, int> catValues)
+    {
+        lock(_sync) {
+            var label = timestamp.ToLongTimeString();  // HH:MM:SS for categorical x-axis
+            var epoch = ToEpochMs(timestamp);          // Milliseconds for datetime x-axis
+
+            _categories.Add(label);
+
+            int tickTotal = 0;
+            foreach(var c in _catNames) {
+                var v = catValues[c];
+                tickTotal += v;
+
+                // Add to categorical data (trimmed)
+                _perCatValues[c].Add(v);
+
+                // Add to time-series data (trimmed)
+                _perCatXY[c].Add(new long[] { epoch, v });
+
+                // Add to full-history data (no trim)
+                _perCatXYAll[c].Add(new long[] { epoch, v });
+            }
+
+            // Update cumulative totals
+            _runningTotal += tickTotal;
+            _xyTotals.Add(new long[] { epoch, _runningTotal });
+            _xyTotalsAll.Add(new long[] { epoch, _runningTotal });
+
+            // Trim windowed collections to MaxPoints
+            TrimToLastN(MaxPoints, _categories);
+            foreach(var c in _catNames) {
+                TrimToLastN(MaxPoints, _perCatValues[c]);
+                TrimToLastN(MaxPointsXY, _perCatXY[c]);
+            }
+            TrimToLastN(MaxPointsXY, _xyTotals);
+
+            // Update all chart bindings
+            RebindAllCharts();
+        }
+    }
+
+    /// <summary>
+    /// Updates all chart binding arrays from the current data stores.
+    /// Must be called within the _sync lock.
+    /// </summary>
+    private void RebindAllCharts()
+    {
+        // Categorical column chart
+        _seriesCategories = _categories.ToArray();
+        _seriesDataPerCategory = _catNames.Select(c => new Highcharts.SeriesDataArray {
+            name = c,
+            data = _perCatValues[c].ToArray()
+        }).ToArray();
+
+        // Line/column time-series (trimmed)
+        _seriesLineXYPerCategory = _catNames.Select(c => new Highcharts.SeriesDataXYArray {
+            name = c,
+            data = _perCatXY[c].ToArray()
+        }).ToArray();
+        _seriesColumnTsXYPerCategory = _seriesLineXYPerCategory;
+
+        // Area totals (trimmed)
+        _seriesAreaTotalsXY = new[] {
+            new Highcharts.SeriesDataXYArray {
+                name = "Totals",
+                data = _xyTotals.ToArray()
+            }
+        };
+
+        // Full-history line chart (no trim)
+        _seriesLineXYPerCategory_All = _catNames.Select(c => new Highcharts.SeriesDataXYArray {
+            name = c,
+            data = _perCatXYAll[c].ToArray()
+        }).ToArray();
+
+        // Pie charts
+        _pieItems = BuildPieByCategoryShare(_perCatValues);
+        (_pieRoot, _pieDrilldown) = BuildPieCategoryDrilldown(_perCatValues);
+    }
+
+    // ============================================================================
+    // TRIM HELPERS
+    // Remove oldest entries to maintain rolling window size.
+    // ============================================================================
+    
+    private static void TrimToLastN(int n, List<string> list)
+    {
+        while(list.Count > n)
+            list.RemoveAt(0);
+    }
+    
+    private static void TrimToLastN(int n, List<decimal> list)
+    {
+        while(list.Count > n)
+            list.RemoveAt(0);
+    }
+    
+    private static void TrimToLastN(int n, List<long[]> list)
+    {
+        while(list.Count > n)
+            list.RemoveAt(0);
+    }
+
+    // ============================================================================
+    // PIE CHART DATA BUILDERS
+    // ============================================================================
+    
+    /// <summary>
+    /// Builds simple pie chart data showing category share as percentages.
+    /// </summary>
+    private static Highcharts.SeriesData[] BuildPieByCategoryShare(
+        Dictionary<string, List<decimal>> perCatValues)
+    {
+        var totals = perCatValues.ToDictionary(kv => kv.Key, kv => kv.Value.Sum());
+        var grand = Math.Max(1m, totals.Values.Sum());  // Avoid divide-by-zero
+
+        return totals
+            .OrderByDescending(kv => kv.Value)
+            .Select(kv => new Highcharts.SeriesData {
+                name = kv.Key,
+                data = Math.Round((kv.Value * 100m) / grand, 2)
+            })
+            .ToArray();
+    }
+
+    /// <summary>
+    /// Builds pie chart with drilldown data.
+    /// Root level shows category percentages.
+    /// Drilldown shows value frequency distribution (1-20) for each category.
+    /// </summary>
+    private static (Highcharts.SeriesData[] root, Highcharts.DrilldownSeries[] drilldown)
+        BuildPieCategoryDrilldown(Dictionary<string, List<decimal>> perCatValues)
+    {
+        var totals = perCatValues.ToDictionary(kv => kv.Key, kv => kv.Value.Sum());
+        var grand = Math.Max(1m, totals.Values.Sum());
+
+        // Root: category percentages
+        var root = totals
+            .OrderByDescending(kv => kv.Value)
+            .Select(kv => new Highcharts.SeriesData {
+                name = kv.Key,
+                data = Math.Round((kv.Value * 100m) / grand, 2)
+            })
+            .ToArray();
+
+        // Drilldown: value frequency for each category
+        var drilldown = new List<Highcharts.DrilldownSeries>();
+        foreach(var kv in perCatValues) {
+            var cat = kv.Key;
+            var vals = kv.Value.Select(v => (int)Math.Round(v)).ToList();
+            
+            // Count frequency of each value 1-20
+            var freq = new Dictionary<int, int>();
+            for(int i = 1; i <= 20; i++)
+                freq[i] = 0;
+            foreach(var iv in vals)
+                if(freq.ContainsKey(iv))
+                    freq[iv]++;
+
+            var series = new Highcharts.DrilldownSeries {
+                id = cat,
+                data = freq
+                    .OrderByDescending(p => p.Value)
+                    .Select(p => new Highcharts.DrilldownPoint { 
+                        name = p.Key.ToString(), 
+                        y = p.Value 
+                    })
+                    .ToArray()
+            };
+            drilldown.Add(series);
+        }
+
+        return (root, drilldown.ToArray());
+    }
+}
