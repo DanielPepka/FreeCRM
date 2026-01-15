@@ -79,6 +79,9 @@ jobs:
           - name: FreePlugins
             branch: FreePlugins_base
             selections: 'keep:Tags'
+          - name: FlexCRM
+            branch: FlexCRM_base
+            selections: 'keep:Tags'
     env:
       SELECTIONS:  ${{ matrix.project.selections }}
       APP_NAME:    ${{ matrix.project.name }}
